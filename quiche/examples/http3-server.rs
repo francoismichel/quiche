@@ -376,6 +376,9 @@ fn main() {
 
                         Ok((_goaway_id, quiche::h3::Event::GoAway)) => (),
 
+                        Ok((_, quiche::h3::Event::PassthroughData(_))) =>
+                            unreachable!(),
+
                         Err(quiche::h3::Error::Done) => {
                             break;
                         },
