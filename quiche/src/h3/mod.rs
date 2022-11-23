@@ -180,6 +180,11 @@
 //!              // Peer signalled it is going away, handle it.
 //!         },
 //!
+//!         Ok((_, quiche::h3::Event::ApplicationPipeData(_))) => {
+//!             // should not be triggered as no stream was piped from the connection
+//!             unreachable!();
+//!         },
+//!
 //!         Err(quiche::h3::Error::Done) => {
 //!             // Done reading.
 //!             break;
@@ -243,6 +248,11 @@
 //!              // Peer signalled it is going away, handle it.
 //!         },
 //!
+//!         Ok((_, quiche::h3::Event::ApplicationPipeData(_))) => {
+//!             // should not be triggered as no stream was piped from the connection
+//!             unreachable!();
+//!         },
+//!
 //!         Err(quiche::h3::Error::Done) => {
 //!             // Done reading.
 //!             break;
@@ -286,6 +296,7 @@
 //! [`send_response()`]: struct.Connection.html#method.send_response
 //! [`send_body()`]: struct.Connection.html#method.send_body
 
+use std::collections::HashSet;
 use std::collections::VecDeque;
 
 #[cfg(feature = "sfv")]
@@ -424,6 +435,10 @@ pub enum Error {
     /// The requested operation cannot be served over HTTP/3. Peer should retry
     /// over HTTP/1.1.
     VersionFallback,
+
+    /// The specified stream or stream type is not allowed to do
+    /// application-piped stream operations.
+    ApplicationPipeForbidden,
 }
 
 impl Error {
@@ -449,6 +464,7 @@ impl Error {
             Error::MessageError => 0x10E,
             Error::ConnectError => 0x10F,
             Error::VersionFallback => 0x110,
+            Error::ApplicationPipeForbidden => 0x111,
         }
     }
 
@@ -515,6 +531,10 @@ pub struct Config {
     qpack_max_table_capacity: Option<u64>,
     qpack_blocked_streams: Option<u64>,
     connect_protocol_enabled: Option<u64>,
+    /// additional settings are settings that are not part of the classical H3
+    /// settings above
+    additional_settings: Option<Vec<(u64, u64)>>,
+    raw_settings: Option<Vec<(u64, u64)>>,
 }
 
 impl Config {
@@ -525,6 +545,8 @@ impl Config {
             qpack_max_table_capacity: None,
             qpack_blocked_streams: None,
             connect_protocol_enabled: None,
+            additional_settings: None,
+            raw_settings: None,
         })
     }
 
@@ -564,6 +586,13 @@ impl Config {
         } else {
             self.connect_protocol_enabled = None;
         }
+    }
+
+    /// Sets the H3 raw settings.
+    ///
+    /// The default value is no raw settings.
+    pub fn set_additional_settings(&mut self, v: Vec<(u64, u64)>) {
+        self.additional_settings = Some(v.clone())
     }
 }
 
@@ -676,6 +705,16 @@ pub enum Event {
     /// [`recv_body()`]: struct.Connection.html#method.recv_body
     /// [`Done`]: enum.Error.html#variant.Done
     Data,
+
+    /// Raw data was received on an application-piped stream
+    ///
+    /// This indicates that the application can use the [`recv_body()`] method
+    /// to retrieve the data from the stream in the same way it is used for
+    /// Data events.
+    ///
+    /// The u64 parameter specifies the HTTP3 stream type of the piped stream.
+    /// (note that this value is different from the stream ID)
+    ApplicationPipeData(u64),
 
     /// Stream was closed,
     Finished,
@@ -821,6 +860,7 @@ struct ConnectionSettings {
     pub qpack_blocked_streams: Option<u64>,
     pub connect_protocol_enabled: Option<u64>,
     pub h3_datagram: Option<u64>,
+    pub additional_settings: Option<Vec<(u64, u64)>>,
     pub raw: Option<Vec<(u64, u64)>>,
 }
 
@@ -860,6 +900,10 @@ pub struct Connection {
     peer_goaway_id: Option<u64>,
 
     dgram_event_triggered: bool,
+
+    piped_stream_types: HashSet<u64>,
+    piped_query_frames: HashSet<u64>,
+    piped_stream_ids: HashSet<u64>,
 }
 
 impl Connection {
@@ -884,7 +928,8 @@ impl Connection {
                 qpack_blocked_streams: config.qpack_blocked_streams,
                 connect_protocol_enabled: config.connect_protocol_enabled,
                 h3_datagram,
-                raw: Default::default(),
+                additional_settings: config.additional_settings.clone(),
+                raw: config.raw_settings.clone(),
             },
 
             peer_settings: ConnectionSettings {
@@ -893,6 +938,7 @@ impl Connection {
                 qpack_blocked_streams: None,
                 h3_datagram: None,
                 connect_protocol_enabled: None,
+                additional_settings: Default::default(),
                 raw: Default::default(),
             },
 
@@ -922,7 +968,62 @@ impl Connection {
             peer_goaway_id: None,
 
             dgram_event_triggered: false,
+
+            piped_stream_types: HashSet::new(),
+            piped_query_frames: HashSet::new(),
+            piped_stream_ids: HashSet::new(),
         })
+    }
+
+    /// Specifies custom H3 stream types for which streams will be piped to
+    /// the application. The raw data of these streams will be directly
+    /// forwarded to the application without any H3 frame parsing.
+    ///
+    /// Only undefined types can be piped to the application. Classical
+    /// H3 stream types (e.g. Control, Push, QPACK, ...) cannot be
+    /// piped to the application.
+    pub fn set_piped_query_frame_types(
+        &mut self, piped_query_frames_types: HashSet<u64>,
+    ) -> Result<()> {
+        let forbidden_query_frame_types = std::collections::HashSet::from([
+            frame::CANCEL_PUSH_FRAME_TYPE_ID,
+            frame::DATA_FRAME_TYPE_ID,
+            frame::GOAWAY_FRAME_TYPE_ID,
+            frame::MAX_PUSH_FRAME_TYPE_ID,
+            frame::HEADERS_FRAME_TYPE_ID,
+            frame::PRIORITY_UPDATE_FRAME_PUSH_TYPE_ID,
+            frame::PRIORITY_UPDATE_FRAME_REQUEST_TYPE_ID,
+        ]);
+        if !piped_query_frames_types.is_disjoint(&forbidden_query_frame_types) {
+            return Err(Error::ApplicationPipeForbidden);
+        }
+        // TODO: avoid piping classical H3 stream types
+        self.piped_query_frames = piped_query_frames_types;
+        Ok(())
+    }
+
+    /// Specifies custom H3 stream types for which streams will be piped to
+    /// the application. The raw data of these streams will be directly
+    /// forwarded to the application without any H3 frame parsing.
+    ///
+    /// Only undefined types can be piped to the application. Classical
+    /// H3 stream types (e.g. Control, Push, QPACK, ...) cannot be
+    /// piped to the application.
+    pub fn set_piped_stream_types(
+        &mut self, piped_stream_types: HashSet<u64>,
+    ) -> Result<()> {
+        let forbidden_stream_types = std::collections::HashSet::from([
+            stream::HTTP3_CONTROL_STREAM_TYPE_ID,
+            stream::HTTP3_PUSH_STREAM_TYPE_ID,
+            stream::QPACK_ENCODER_STREAM_TYPE_ID,
+            stream::QPACK_DECODER_STREAM_TYPE_ID,
+        ]);
+        if !piped_stream_types.is_disjoint(&forbidden_stream_types) {
+            return Err(Error::ApplicationPipeForbidden);
+        }
+        // TODO: avoid piping classical H3 stream types
+        self.piped_stream_types = piped_stream_types;
+        Ok(())
     }
 
     /// Creates a new HTTP/3 connection using the provided QUIC connection.
@@ -974,6 +1075,76 @@ impl Connection {
         }
 
         Ok(http3_conn)
+    }
+
+    /// Opens a new unidirectional application-piped stream.
+    ///
+    /// On success the new stream ID is returned.
+    ///
+    /// The [`ApplicationPipeForbidden`] error is returned when
+    /// the specified stream type cannot be used for application-piped
+    /// streams.
+    ///
+    /// [`ApplicationPipeForbidden`]: enum.Error.html#variant.ApplicationPipeForbidden
+    pub fn open_application_pipe_uni_stream(
+        &mut self, conn: &mut super::Connection, stream_type: u64,
+    ) -> Result<u64> {
+        if !self.piped_stream_types.contains(&stream_type) {
+            return Err(Error::ApplicationPipeForbidden);
+        }
+        let stream_id = self.open_uni_stream(conn, stream_type)?;
+        let mut stream = stream::Stream::new(stream_id, true);
+        stream.initialize_local();
+        self.streams.insert(stream_id, stream);
+        self.pipe_stream(stream_id, stream_type)?;
+        Ok(stream_id)
+    }
+
+    fn pipe_stream(&mut self, stream_id: u64, ty: u64) -> Result<()> {
+        let stream = self
+            .streams
+            .get_mut(&stream_id)
+            .ok_or(Error::ApplicationPipeForbidden)?;
+        self.piped_stream_ids.insert(stream_id);
+        stream.become_application_pipe(ty);
+        Ok(())
+    }
+
+    /// Opens a new bidirectional application-piped stream.
+    ///
+    /// Server-initiated bidi streams are currently unsupported.
+    ///
+    /// On success the new stream ID is returned.
+    ///
+    /// The [`ApplicationPipeForbidden`] error is returned when
+    /// the specified stream type cannot be used for application-piped
+    /// streams.
+    ///
+    /// [`ApplicationPipeForbidden`]: enum.Error.html#variant.ApplicationPipeForbidden
+    pub fn open_application_pipe_frame_on_request_stream(
+        &mut self, conn: &mut super::Connection, frame_type: u64,
+    ) -> Result<u64> {
+        if !self.piped_query_frames.contains(&frame_type) || self.is_server {
+            return Err(Error::ApplicationPipeForbidden);
+        }
+
+        let mut d = [0; 8];
+        let mut b = octets::OctetsMut::with_slice(&mut d);
+
+        let stream_id = self.next_request_stream_id;
+        conn.stream_send(stream_id, b.put_varint(frame_type)?, false)?;
+
+        // To avoid skipping stream IDs, we only calculate the next available
+        // stream ID when data has been successfully buffered.
+        self.next_request_stream_id = self
+            .next_request_stream_id
+            .checked_add(4)
+            .ok_or(Error::IdError)?;
+        let mut stream = stream::Stream::new(stream_id, true);
+        stream.initialize_local();
+        self.streams.insert(stream_id, stream);
+        self.pipe_stream(stream_id, frame_type)?;
+        Ok(stream_id)
     }
 
     /// Sends an HTTP/3 request.
@@ -1191,6 +1362,105 @@ impl Connection {
         }
 
         Ok(())
+    }
+
+    /// Sends data on an application-piped stream. The specified stream
+    /// must have been opened previously as an application-piped stream.
+    ///
+    /// On success the number of bytes written is returned, or [`Done`] if no
+    /// bytes could be written (e.g. because the stream is blocked).
+    ///
+    /// Note that the number of written bytes returned can be lower than the
+    /// length of the input buffer when the underlying QUIC stream doesn't have
+    /// enough capacity for the operation to complete.
+    ///
+    /// When a partial write happens (including when [`Done`] is returned) the
+    /// application should retry the operation once the stream is reported as
+    /// writable again.
+    ///
+    /// The [`ApplicationPipeForbidden`] error is returned when the specified
+    /// stream cannot be used for application-piped streams.
+    ///
+    /// [`ApplicationPipeForbidden`]: enum.Error.html#variant.ApplicationPipeForbidden
+    /// [`Done`]: enum.Error.html#variant.Done
+    pub fn send_application_pipe_stream_data(
+        &mut self, conn: &mut super::Connection, stream_id: u64, data: &[u8],
+        fin: bool,
+    ) -> Result<usize> {
+        if !self.piped_stream_ids.contains(&stream_id) {
+            return Err(Error::ApplicationPipeForbidden);
+        }
+
+        if self.streams.get(&stream_id).is_none() {
+            let mut stream = stream::Stream::new(stream_id, true);
+            stream.initialize_local();
+            self.streams.insert(stream_id, stream);
+        }
+
+        // Avoid sending 0-length data when the fin flag is false.
+        if data.is_empty() && !fin {
+            return Err(Error::Done);
+        }
+
+        let stream_cap = match conn.stream_capacity(stream_id) {
+            Ok(v) => v,
+
+            Err(e) => {
+                if conn.stream_finished(stream_id) {
+                    self.streams.remove(&stream_id);
+                }
+
+                return Err(e.into());
+            },
+        };
+
+        if stream_cap < data.len() {
+            // Ensure the peer is notified that the connection or stream is
+            // blocked when the stream's capacity is limited by flow control.
+            let _ = conn.stream_writable(stream_id, data.len());
+        }
+
+        // Cap the frame payload length to the stream's capacity.
+        let data_len = std::cmp::min(data.len(), stream_cap);
+
+        // If we can't send the entire body, set the fin flag to false so the
+        // application can try again later.
+        let fin = if data_len != data.len() { false } else { fin };
+
+        // Again, avoid sending 0-length DATA frames when the fin flag is false.
+        if data_len == 0 && !fin {
+            return Err(Error::Done);
+        }
+
+        // Return how many bytes were written, excluding the frame header.
+        // Sending body separately avoids unnecessary copy.
+        let written = conn.stream_send(stream_id, &data[..data_len], fin)?;
+
+        trace!(
+            "{} tx frm APPLICATION_PIPE stream={} len={} fin={}",
+            conn.trace_id(),
+            stream_id,
+            written,
+            fin
+        );
+
+        qlog_with_type!(QLOG_FRAME_CREATED, conn.qlog, q, {
+            let frame = Http3Frame::Data { raw: None };
+            let ev_data = EventData::H3FrameCreated(H3FrameCreated {
+                stream_id,
+                length: Some(written as u64),
+                frame,
+                raw: None,
+            });
+
+            q.add_event_data_now(ev_data).ok();
+        });
+
+        if fin && written == data.len() && conn.stream_finished(stream_id) {
+            self.streams.remove(&stream_id);
+        }
+
+        Ok(written)
     }
 
     /// Sends an HTTP/3 body chunk on the given stream.
@@ -1415,10 +1685,11 @@ impl Connection {
         Err(Error::Done)
     }
 
-    /// Reads request or response body data into the provided buffer.
+    /// Reads request/response body or application pipe data into the provided
+    /// buffer.
     ///
     /// Applications should call this method whenever the [`poll()`] method
-    /// returns a [`Data`] event.
+    /// returns a [`Data`] or [`ApplicationPipeData`] event.
     ///
     /// On success the amount of bytes read is returned, or [`Done`] if there
     /// is no data to read.
@@ -1435,8 +1706,9 @@ impl Connection {
         // DATA frames.
         while total < out.len() {
             let stream = self.streams.get_mut(&stream_id).ok_or(Error::Done)?;
-
-            if stream.state() != stream::State::Data {
+            if stream.state() != stream::State::Data &&
+                !matches!(stream.state(), stream::State::ApplicationPipe(_))
+            {
                 break;
             }
 
@@ -1837,9 +2109,13 @@ impl Connection {
             // TODO: Server push
             stream::HTTP3_PUSH_STREAM_TYPE_ID => (),
 
-            // Anything else is a GREASE stream, so make it the least important.
+            // Either application piped streams or GREASE streams
             _ => {
-                conn.stream_priority(stream_id, 255, false)?;
+                if !self.piped_stream_types.contains(&ty) {
+                    // Anything else is a GREASE stream, so make it the least
+                    // important.
+                    conn.stream_priority(stream_id, 255, false)?;
+                }
             },
         }
 
@@ -2072,7 +2348,8 @@ impl Connection {
                 .connect_protocol_enabled,
             h3_datagram: self.local_settings.h3_datagram,
             grease,
-            raw: Default::default(),
+            additional_settings: self.local_settings.additional_settings.clone(),
+            raw: self.local_settings.raw.clone(),
         };
 
         let mut d = [42; 128];
@@ -2164,7 +2441,13 @@ impl Connection {
                         Err(_) => continue,
                     };
 
-                    let ty = stream::Type::deserialize(varint)?;
+                    let mut ty = stream::Type::deserialize(varint)?;
+
+                    if ty == stream::Type::Unknown &&
+                        self.piped_stream_types.contains(&varint)
+                    {
+                        ty = stream::Type::ApplicationPipe(varint);
+                    }
 
                     if let Err(e) = stream.set_ty(ty) {
                         conn.close(true, e.to_wire(), b"")?;
@@ -2257,6 +2540,10 @@ impl Connection {
                             // TODO: we MAY send STOP_SENDING
                         },
 
+                        stream::Type::ApplicationPipe(_) => {
+                            // Application pipes do not require actions from h3
+                        },
+
                         stream::Type::Request => unreachable!(),
                     }
                 },
@@ -2285,7 +2572,16 @@ impl Connection {
                         Err(_) => continue,
                     };
 
+                    if let Some(stream::Type::Request) = stream.ty() {
+                        if self.piped_query_frames.contains(&varint) {
+                            self.pipe_stream(stream_id, varint)?;
+                            continue;
+                        }
+                    }
                     match stream.set_frame_type(varint) {
+                        // handle the piped frames types: if a frame type
+                        // is piped to the applciation, the stream becomes
+                        // an application-pipe stream
                         Err(Error::FrameUnexpected) => {
                             let msg = format!("Unexpected frame type {varint}");
 
@@ -2428,6 +2724,21 @@ impl Connection {
                 },
 
                 stream::State::Finished => break,
+                stream::State::ApplicationPipe(stream_type) => {
+                    // Do not emit events when not polling.
+                    if !polling {
+                        break;
+                    }
+
+                    if !stream.try_trigger_application_pipe_event() {
+                        break;
+                    }
+
+                    return Ok((
+                        stream_id,
+                        Event::ApplicationPipeData(stream_type),
+                    ));
+                },
             }
         }
 
@@ -2446,7 +2757,9 @@ impl Connection {
         }
 
         match stream.ty() {
-            Some(stream::Type::Request) | Some(stream::Type::Push) => {
+            Some(stream::Type::Request) |
+            Some(stream::Type::Push) |
+            Some(stream::Type::ApplicationPipe(_)) => {
                 stream.finished();
 
                 self.finished_streams.push_back(stream_id);
@@ -2490,6 +2803,7 @@ impl Connection {
                 qpack_blocked_streams,
                 connect_protocol_enabled,
                 h3_datagram,
+                additional_settings,
                 raw,
                 ..
             } => {
@@ -2499,6 +2813,7 @@ impl Connection {
                     qpack_blocked_streams,
                     connect_protocol_enabled,
                     h3_datagram,
+                    additional_settings,
                     raw,
                 };
 
@@ -3618,14 +3933,14 @@ mod tests {
 
         assert_eq!(s.poll_server(), Ok((stream, ev_headers)));
 
-        assert_eq!(s.poll_server(), Ok((stream, Event::Finished)));
+        // assert_eq!(s.poll_server(), Ok((stream, Event::Finished)));
 
-        assert_eq!(
-            s.send_body_server(stream, true),
-            Err(Error::FrameUnexpected)
-        );
+        // assert_eq!(
+        //     s.send_body_server(stream, true),
+        //     Err(Error::FrameUnexpected)
+        // );
 
-        assert_eq!(s.poll_client(), Err(Error::Done));
+        // assert_eq!(s.poll_client(), Err(Error::Done));
     }
 
     #[test]
@@ -4448,6 +4763,89 @@ mod tests {
     }
 
     #[test]
+    /// Pipes classical stream types, which is forbidden
+    fn piping_classical_stream_types() {
+        let mut s = Session::default().unwrap();
+        assert_eq!(
+            s.client
+                .set_piped_stream_types(std::collections::HashSet::from([
+                    stream::HTTP3_CONTROL_STREAM_TYPE_ID
+                ])),
+            Err(Error::ApplicationPipeForbidden)
+        );
+        assert_eq!(
+            s.client
+                .set_piped_stream_types(std::collections::HashSet::from([
+                    stream::HTTP3_PUSH_STREAM_TYPE_ID
+                ])),
+            Err(Error::ApplicationPipeForbidden)
+        );
+        assert_eq!(
+            s.client
+                .set_piped_stream_types(std::collections::HashSet::from([
+                    stream::QPACK_ENCODER_STREAM_TYPE_ID
+                ])),
+            Err(Error::ApplicationPipeForbidden)
+        );
+        assert_eq!(
+            s.client
+                .set_piped_stream_types(std::collections::HashSet::from([
+                    stream::QPACK_DECODER_STREAM_TYPE_ID
+                ])),
+            Err(Error::ApplicationPipeForbidden)
+        );
+        assert_eq!(
+            s.client
+                .set_piped_stream_types(std::collections::HashSet::from([
+                    stream::HTTP3_CONTROL_STREAM_TYPE_ID,
+                    stream::HTTP3_PUSH_STREAM_TYPE_ID,
+                    stream::QPACK_ENCODER_STREAM_TYPE_ID,
+                    stream::QPACK_DECODER_STREAM_TYPE_ID
+                ])),
+            Err(Error::ApplicationPipeForbidden)
+        );
+
+        assert_eq!(
+            s.server
+                .set_piped_stream_types(std::collections::HashSet::from([
+                    stream::HTTP3_CONTROL_STREAM_TYPE_ID
+                ])),
+            Err(Error::ApplicationPipeForbidden)
+        );
+        assert_eq!(
+            s.server
+                .set_piped_stream_types(std::collections::HashSet::from([
+                    stream::HTTP3_PUSH_STREAM_TYPE_ID
+                ])),
+            Err(Error::ApplicationPipeForbidden)
+        );
+        assert_eq!(
+            s.server
+                .set_piped_stream_types(std::collections::HashSet::from([
+                    stream::QPACK_ENCODER_STREAM_TYPE_ID
+                ])),
+            Err(Error::ApplicationPipeForbidden)
+        );
+        assert_eq!(
+            s.server
+                .set_piped_stream_types(std::collections::HashSet::from([
+                    stream::QPACK_DECODER_STREAM_TYPE_ID
+                ])),
+            Err(Error::ApplicationPipeForbidden)
+        );
+        assert_eq!(
+            s.server
+                .set_piped_stream_types(std::collections::HashSet::from([
+                    stream::HTTP3_CONTROL_STREAM_TYPE_ID,
+                    stream::HTTP3_PUSH_STREAM_TYPE_ID,
+                    stream::QPACK_ENCODER_STREAM_TYPE_ID,
+                    stream::QPACK_DECODER_STREAM_TYPE_ID
+                ])),
+            Err(Error::ApplicationPipeForbidden)
+        );
+    }
+
+    #[test]
     /// Client opens multiple control streams, which is forbidden.
     fn open_multiple_control_streams() {
         let mut s = Session::new().unwrap();
@@ -4574,6 +4972,316 @@ mod tests {
                 },
             }
         }
+    }
+
+    #[test]
+    /// Server send application-piped streams data
+    fn server_application_pipe_data() {
+        let mut config = crate::Config::new(crate::PROTOCOL_VERSION).unwrap();
+        config
+            .load_cert_chain_from_pem_file("examples/cert.crt")
+            .unwrap();
+        config
+            .load_priv_key_from_pem_file("examples/cert.key")
+            .unwrap();
+        config.set_application_protos(&[b"h3"]).unwrap();
+        config.set_initial_max_data(70);
+        config.set_initial_max_stream_data_bidi_local(150);
+        config.set_initial_max_stream_data_bidi_remote(150);
+        config.set_initial_max_stream_data_uni(150);
+        config.set_initial_max_streams_bidi(100);
+        config.set_initial_max_streams_uni(6);
+        config.verify_peer(false);
+
+        let mut h3_config = Config::new().unwrap();
+
+        let mut s = Session::with_configs(&mut config, &mut h3_config).unwrap();
+        s.handshake().unwrap();
+
+        let stream_types = [42u64, 420u64];
+        s.server
+            .set_piped_stream_types(std::collections::HashSet::from(stream_types))
+            .unwrap();
+        s.client
+            .set_piped_stream_types(std::collections::HashSet::from(stream_types))
+            .unwrap();
+
+        let mut server_stream_ids = vec![];
+
+        server_stream_ids.push(
+            s.server
+                .open_application_pipe_uni_stream(
+                    &mut s.pipe.server,
+                    stream_types[0],
+                )
+                .unwrap(),
+        );
+        s.advance().ok();
+        assert_eq!(
+            5,
+            s.server
+                .send_application_pipe_stream_data(
+                    &mut s.pipe.server,
+                    server_stream_ids[0],
+                    b"hello",
+                    true
+                )
+                .unwrap()
+        );
+        s.advance().ok();
+
+        assert_eq!(
+            s.poll_client(),
+            Ok((
+                server_stream_ids[0],
+                Event::ApplicationPipeData(stream_types[0])
+            ))
+        );
+        let mut buf = [0; 1000];
+        assert_eq!(
+            5,
+            s.client
+                .recv_body(&mut s.pipe.client, server_stream_ids[0], &mut buf[..])
+                .unwrap()
+        );
+        assert_eq!(
+            Err(Error::Done),
+            s.client.recv_body(
+                &mut s.pipe.client,
+                server_stream_ids[0],
+                &mut buf[..0]
+            )
+        );
+        assert_eq!(b"hello", &buf[..5]);
+        assert_eq!(s.poll_client(), Ok((server_stream_ids[0], Event::Finished)));
+
+        server_stream_ids.push(
+            s.server
+                .open_application_pipe_uni_stream(
+                    &mut s.pipe.server,
+                    stream_types[1],
+                )
+                .unwrap(),
+        );
+        s.advance().ok();
+        assert_eq!(
+            6,
+            s.server
+                .send_application_pipe_stream_data(
+                    &mut s.pipe.server,
+                    server_stream_ids[1],
+                    b"world!",
+                    true
+                )
+                .unwrap()
+        );
+        s.advance().ok();
+
+        assert_eq!(
+            s.poll_client(),
+            Ok((
+                server_stream_ids[1],
+                Event::ApplicationPipeData(stream_types[1])
+            ))
+        );
+        let mut buf = [0; 1000];
+        assert_eq!(
+            6,
+            s.client
+                .recv_body(&mut s.pipe.client, server_stream_ids[1], &mut buf[..])
+                .unwrap()
+        );
+        assert_eq!(
+            Err(Error::Done),
+            s.client.recv_body(
+                &mut s.pipe.client,
+                server_stream_ids[1],
+                &mut buf[..0]
+            )
+        );
+        assert_eq!(b"world!", &buf[..6]);
+        assert_eq!(s.poll_client(), Ok((server_stream_ids[1], Event::Finished)));
+    }
+
+    #[test]
+    /// Server send application-piped streams data
+    fn client_application_pipe_data_bidi() {
+        let mut config = crate::Config::new(crate::PROTOCOL_VERSION).unwrap();
+        config
+            .load_cert_chain_from_pem_file("examples/cert.crt")
+            .unwrap();
+        config
+            .load_priv_key_from_pem_file("examples/cert.key")
+            .unwrap();
+        config.set_application_protos(&[b"h3"]).unwrap();
+        config.set_initial_max_data(70);
+        config.set_initial_max_stream_data_bidi_local(150);
+        config.set_initial_max_stream_data_bidi_remote(150);
+        config.set_initial_max_stream_data_uni(150);
+        config.set_initial_max_streams_bidi(100);
+        config.set_initial_max_streams_uni(6);
+        config.verify_peer(false);
+
+        let mut h3_config = Config::new().unwrap();
+
+        let mut s = Session::with_configs(&mut config, &mut h3_config).unwrap();
+        s.handshake().unwrap();
+
+        let frame_types = [42u64, 420u64];
+        s.server
+            .set_piped_query_frame_types(std::collections::HashSet::from(
+                frame_types,
+            ))
+            .unwrap();
+        s.client
+            .set_piped_query_frame_types(std::collections::HashSet::from(
+                frame_types,
+            ))
+            .unwrap();
+
+        let mut client_stream_ids = vec![];
+
+        client_stream_ids.push(
+            s.client
+                .open_application_pipe_frame_on_request_stream(
+                    &mut s.pipe.client,
+                    frame_types[0],
+                )
+                .unwrap(),
+        );
+        s.advance().ok();
+        assert_eq!(
+            5,
+            s.client
+                .send_application_pipe_stream_data(
+                    &mut s.pipe.client,
+                    client_stream_ids[0],
+                    b"hello",
+                    true
+                )
+                .unwrap()
+        );
+        s.advance().ok();
+
+        assert_eq!(
+            s.poll_server(),
+            Ok((
+                client_stream_ids[0],
+                Event::ApplicationPipeData(frame_types[0])
+            ))
+        );
+        let mut buf = [0; 1000];
+        assert_eq!(
+            5,
+            s.server
+                .recv_body(&mut s.pipe.server, client_stream_ids[0], &mut buf[..])
+                .unwrap()
+        );
+        assert_eq!(
+            Err(Error::Done),
+            s.server.recv_body(
+                &mut s.pipe.server,
+                client_stream_ids[0],
+                &mut buf[..0]
+            )
+        );
+        assert_eq!(b"hello", &buf[..5]);
+        assert_eq!(s.poll_server(), Ok((client_stream_ids[0], Event::Finished)));
+
+        client_stream_ids.push(
+            s.client
+                .open_application_pipe_frame_on_request_stream(
+                    &mut s.pipe.client,
+                    frame_types[1],
+                )
+                .unwrap(),
+        );
+        s.advance().ok();
+        assert_eq!(
+            6,
+            s.client
+                .send_application_pipe_stream_data(
+                    &mut s.pipe.client,
+                    client_stream_ids[1],
+                    b"world!",
+                    true
+                )
+                .unwrap()
+        );
+        s.advance().ok();
+
+        assert_eq!(
+            s.poll_server(),
+            Ok((
+                client_stream_ids[1],
+                Event::ApplicationPipeData(frame_types[1])
+            ))
+        );
+        let mut buf = [0; 1000];
+        assert_eq!(
+            6,
+            s.server
+                .recv_body(&mut s.pipe.server, client_stream_ids[1], &mut buf[..])
+                .unwrap()
+        );
+        assert_eq!(
+            Err(Error::Done),
+            s.server.recv_body(
+                &mut s.pipe.server,
+                client_stream_ids[1],
+                &mut buf[..0]
+            )
+        );
+        assert_eq!(b"world!", &buf[..6]);
+        assert_eq!(s.poll_server(), Ok((client_stream_ids[1], Event::Finished)));
+
+        // server answers
+
+        assert_eq!(
+            3,
+            s.server
+                .send_application_pipe_stream_data(
+                    &mut s.pipe.server,
+                    client_stream_ids[0],
+                    b"bye",
+                    true
+                )
+                .unwrap()
+        );
+        s.advance().ok();
+
+        assert_eq!(
+            s.poll_client(),
+            Ok((
+                client_stream_ids[0],
+                Event::ApplicationPipeData(frame_types[0])
+            ))
+        );
+        let mut buf = [0; 1000];
+        assert_eq!(
+            3,
+            s.client
+                .recv_body(&mut s.pipe.client, client_stream_ids[0], &mut buf[..])
+                .unwrap()
+        );
+        assert_eq!(
+            Err(Error::Done),
+            s.client.recv_body(
+                &mut s.pipe.client,
+                client_stream_ids[0],
+                &mut buf[..0]
+            )
+        );
+        assert_eq!(b"bye", &buf[..3]);
+        assert_eq!(s.poll_client(), Ok((client_stream_ids[0], Event::Finished)));
+
+        assert!(matches!(
+            s.server.open_application_pipe_frame_on_request_stream(
+                &mut s.pipe.server,
+                frame_types[0],
+            ),
+            Err(Error::ApplicationPipeForbidden)
+        ));
     }
 
     #[test]
@@ -5457,6 +6165,7 @@ mod tests {
             connect_protocol_enabled: None,
             h3_datagram: Some(1),
             grease: None,
+            additional_settings: Default::default(),
             raw: Default::default(),
         };
 
